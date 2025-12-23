@@ -71,7 +71,11 @@ from peft import PeftModel
 
 def find_checkpoint_by_config_id(config_id):
     """
-    根据配置ID查找最新的checkpoint。
+    根据配置ID查找checkpoint。
+    
+    【查找优先级】
+    1. best_model目录（训练时保存的最佳模型）
+    2. checkpoints目录中最新的checkpoint
     
     【参数】
     - config_id: 配置ID（0-4）
@@ -79,9 +83,14 @@ def find_checkpoint_by_config_id(config_id):
     【返回】
     - checkpoint_path: 找到的checkpoint路径，或 None
     """
+    # 优先查找best_model
+    best_model_dir = Path(f"./output/config_{config_id}/best_model")
+    if best_model_dir.exists() and best_model_dir.is_dir():
+        return str(best_model_dir)
+    
+    # 查找checkpoints目录中的最新checkpoint
     base_dir = Path(f"./output/config_{config_id}/checkpoints")
     
-    # 查找所有checkpoint目录
     checkpoint_dirs = []
     if base_dir.exists():
         for item in base_dir.iterdir():

@@ -56,7 +56,6 @@ from config.load_key import load_key
 import os
 import json
 import matplotlib.pyplot as plt
-import platform
 import seaborn as sns
 import pandas as pd
 
@@ -502,18 +501,8 @@ def demo_visual_evaluation():
     df = df.reset_index().rename(columns={'index': 'Dim'})
     df_long = df.melt(id_vars='Dim', var_name='Version', value_name='Score')
     
-    # 绘制分组柱状图
+    # 绘制分组柱状图（使用英文标签，避免字体兼容性问题）
     print("\n📈 生成可视化图表...")
-    
-    # 设置中文字体（根据操作系统）
-    system = platform.system()
-    if system == 'Darwin':  # macOS
-        plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
-    elif system == 'Windows':
-        plt.rcParams['font.sans-serif'] = ['SimHei']
-    else:  # Linux
-        plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei']
-    plt.rcParams['axes.unicode_minus'] = False
     
     plt.figure(figsize=(10, 6))
     ax = sns.barplot(
@@ -542,7 +531,7 @@ def demo_visual_evaluation():
     ax.set_ylim(0, 6)
     ax.set_ylabel('Score (1-5)', fontsize=12)
     ax.set_xlabel('')  # 隐藏 X 轴标题
-    ax.set_title('Evaluation', fontsize=20)
+    ax.set_title('Meta-Prompting Evaluation Comparison', fontsize=16, fontweight='bold')
     ax.tick_params(axis='x', labelsize=12)
     
     plt.legend()

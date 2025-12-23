@@ -417,45 +417,38 @@ def plot_training_curves(checkpoint_path, output_dir="./output", output_filename
             print(f"⚠️  未找到 loss 数据")
             return False
         
-        # 设置中文字体（Mac 使用 Arial Unicode MS）
-        if os.uname().sysname == 'Darwin':  # macOS
-            plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
-        else:
-            plt.rcParams['font.sans-serif'] = ['SimHei']
-        plt.rcParams['axes.unicode_minus'] = False
-        
-        # 创建图表
+        # 创建图表（使用英文标签，避免字体兼容性问题）
         fig, ax = plt.subplots(figsize=(12, 6))
         
         # 绘制训练 loss
         if train_losses:
-            ax.plot(train_steps, train_losses, label='训练 Loss (中间步骤)', 
+            ax.plot(train_steps, train_losses, label='Training Loss (Steps)', 
                    color='#1f77b4', linewidth=2, marker='o', markersize=6)
         
         # 添加最终训练 loss 的标注（整体平均值）
         if final_train_loss is not None:
             ax.scatter([final_step], [final_train_loss], 
                       color='#d62728', marker='*', s=200, zorder=5,
-                      label=f'最终训练 Loss (平均)', edgecolors='black', linewidths=1)
+                      label='Final Training Loss (Avg)', edgecolors='black', linewidths=1)
         
         # 绘制评估 loss
         if eval_losses:
-            ax.plot(eval_steps, eval_losses, label='评估 Loss', 
+            ax.plot(eval_steps, eval_losses, label='Eval Loss', 
                    color='#ff7f0e', linewidth=2, marker='s', markersize=4)
         
         # 设置标题和标签
-        ax.set_xlabel('训练步数 (Steps)', fontsize=12)
+        ax.set_xlabel('Training Steps', fontsize=12)
         ax.set_ylabel('Loss', fontsize=12)
-        ax.set_title('训练过程 Loss 变化曲线', fontsize=14, fontweight='bold')
+        ax.set_title('Training Loss Curve', fontsize=14, fontweight='bold')
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         
         # 添加信息文本
         info_text_lines = []
         if final_train_loss is not None:
-            info_text_lines.append(f'最终训练 Loss (平均): {final_train_loss:.4f}')
+            info_text_lines.append(f'Final Train Loss (Avg): {final_train_loss:.4f}')
         if eval_losses:
-            info_text_lines.append(f'最终评估 Loss: {eval_losses[-1]:.4f}')
+            info_text_lines.append(f'Final Eval Loss: {eval_losses[-1]:.4f}')
         
         if info_text_lines:
             info_text = '\n'.join(info_text_lines)

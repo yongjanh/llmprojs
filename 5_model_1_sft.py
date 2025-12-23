@@ -108,6 +108,11 @@ import torch
 import glob
 import shutil
 import json
+
+# 消除训练过程中的警告信息
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 from datasets import load_dataset as hf_load_dataset
 from transformers import (
     AutoTokenizer,
@@ -117,93 +122,93 @@ from transformers import (
     DataCollatorForSeq2Seq,
 )
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
-from chatbot.sft_utils import detect_device, plot_training_curves
-
-
-def disable_mps_if_needed():
-    """在force_cpu模式下完全禁用MPS"""
-    if torch.backends.mps.is_available():
-        # 设置环境变量禁用MPS
-        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-        # 直接设置torch不使用MPS
-        torch.set_default_device('cpu')
-        print("   → MPS已禁用，所有操作将在CPU上进行")
+from chatbot.sft_utils import plot_training_curves
 
 
 # ==============================================================================
-# 预设配置：5种内置配置方案
+# 预设配置：5种内置配置方案（已优化，对齐原始swift配置）
+# ==============================================================================
+# 【优化要点】
+# - warmup_steps=100（固定步数，而非比例）→ Config 3预热占比大，训练相对不足
+# - weight_decay=0.1（增强正则化）→ 防止小数据集过拟合
+# - lr_scheduler_type="cosine"（余弦衰减）→ 学习率更平滑优雅
 # ==============================================================================
 PRESET_CONFIGS = {
     0: {
         "name": "过大学习率测试",
         "description": "故意设置过大的学习率（0.1），观察训练不稳定、loss震荡或发散现象",
-        "learning_rate": 0.1,
+        "learning_rate": 0.1,  # 过大的学习率（正常值的2000倍）
         "lora_rank": 4,
         "num_train_epochs": 1,
         "train_file": "./resources/train_100.jsonl",
         "batch_size": 8,
         "gradient_accumulation_steps": 2,
         "max_length": 512,
-        "save_steps": 1,
+        "save_steps": 1,  # 每步都保存，观察训练初期的细节变化
+        "split_ratio": 0.1,
     },
     1: {
         "name": "快速验证（推荐）",
-        "description": "使用标准配置快速验证流程，已启用内存优化（Gradient Checkpointing）",
-        "learning_rate": 5e-5,
-        "lora_rank": 4,
-        "num_train_epochs": 1,
+        "description": "使用标准配置快速验证流程（1轮训练）",
+        "learning_rate": 5e-5,  # 标准学习率
+        "lora_rank": 4,  # 小秩，适合100样本的小数据集
+        "num_train_epochs": 1,  # 仅1轮，用于快速验证流程可行性
         "train_file": "./resources/train_100.jsonl",
-        "batch_size": 2,  # 降低batch_size以适应内存限制
-        "gradient_accumulation_steps": 8,  # 增加累积步数，保持有效batch_size=16
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,  # 有效批次=16
         "max_length": 512,
-        "save_steps": 1,
+        "save_steps": 1,  # 每步都保存，便于观察训练初期
+        "split_ratio": 0.1,  # 90训练+10验证
     },
     2: {
         "name": "小数据集长训练",
         "description": "在小数据集上进行长时间训练（50轮），观察过拟合现象",
         "learning_rate": 5e-5,
         "lora_rank": 4,
-        "num_train_epochs": 50,
+        "num_train_epochs": 50,  # 充分训练，使模型在小数据集上过拟合
         "train_file": "./resources/train_100.jsonl",
-        "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "max_length": 512,
-        "save_steps": 20,
+        "save_steps": 20,  # 每20步保存/评估（总300步，保存15次）
+        "split_ratio": 0.1,  # 用于观察训练Loss与验证Loss的分离
     },
     3: {
         "name": "大数据集标准训练",
-        "description": "使用1k样本进行标准3轮训练，较好的性能/时间平衡",
+        "description": "使用1k样本进行3轮训练，由于warmup占比大（100/178步=56%），预期训练不够充分（欠拟合示例）",
         "learning_rate": 5e-5,
-        "lora_rank": 8,
-        "num_train_epochs": 3,
+        "lora_rank": 8,  # 较大的秩，匹配更多的训练数据
+        "num_train_epochs": 3,  # 标准训练轮数，平衡效果与速度
         "train_file": "./resources/train_1k.jsonl",
-        "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "max_length": 512,
         "save_steps": 20,
+        "split_ratio": 0.05,  # 950训练+50验证，验证集比例适中
     },
     4: {
         "name": "大数据集长训练",
-        "description": "使用1k样本进行15轮长训练，追求最佳性能（耗时较长）",
+        "description": "使用1k样本进行15轮训练，warmup占比合理（100/890步=11%），充分训练达到最佳效果",
         "learning_rate": 5e-5,
         "lora_rank": 8,
-        "num_train_epochs": 15,
+        "num_train_epochs": 15,  # 充分训练，追求最佳效果
         "train_file": "./resources/train_1k.jsonl",
-        "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "max_length": 512,
-        "save_steps": 20,
+        "save_steps": 20,  # 总1000步，保存50次
+        "split_ratio": 0.05,
     },
 }
 
 
-def load_and_prepare_dataset(train_file, split_ratio=0.01):
+def load_and_prepare_dataset(train_file, split_ratio=0.1):
     """
-    加载并准备数据集。
+    加载并准备数据集（GPU训练，始终使用验证集）。
     
     【参数】
     - train_file: 训练数据文件路径（JSONL格式）
-    - split_ratio: 验证集分割比例
+    - split_ratio: 验证集分割比例（>0，所有配置都有验证集）
     
     【返回】
     - train_dataset: 训练数据集
@@ -218,14 +223,10 @@ def load_and_prepare_dataset(train_file, split_ratio=0.01):
     # 转换为HuggingFace Dataset格式
     dataset = hf_load_dataset('json', data_files={'train': train_file}, split='train')
     
-    # 分割训练集和验证集
-    if split_ratio > 0:
-        split_dataset = dataset.train_test_split(test_size=split_ratio, seed=42)
-        train_dataset = split_dataset['train']
-        eval_dataset = split_dataset['test']
-    else:
-        train_dataset = dataset
-        eval_dataset = None
+    # 分割训练集和验证集（所有配置都使用验证集）
+    split_dataset = dataset.train_test_split(test_size=split_ratio, seed=42)
+    train_dataset = split_dataset['train']
+    eval_dataset = split_dataset['test']
     
     return train_dataset, eval_dataset
 
@@ -284,7 +285,7 @@ def tokenize_function(examples, tokenizer, max_length=512):
     return model_inputs
 
 
-def run_fine_tune(config_id, model_path="./model", device=None):
+def run_fine_tune(config_id, model_path="./model"):
     """
     运行 LoRA 微调实验。
     
@@ -294,7 +295,6 @@ def run_fine_tune(config_id, model_path="./model", device=None):
     【参数】
     - config_id: 配置ID（0-4）
     - model_path: 基座模型路径
-    - device: 训练设备（None 则自动检测）
     
     【返回】
     - checkpoint_path: 微调后的 checkpoint 路径
@@ -307,7 +307,7 @@ def run_fine_tune(config_id, model_path="./model", device=None):
     config = PRESET_CONFIGS[config_id]
     
     print("\n" + "🎓 " + "="*76 + " 🎓")
-    print("    本地模型监督微调（SFT）")
+    print("    本地模型监督微调（SFT - GPU）")
     print(f"    配置ID: {config_id} - {config['name']}")
     print("🎓 " + "="*76 + " 🎓")
     
@@ -315,51 +315,33 @@ def run_fine_tune(config_id, model_path="./model", device=None):
         print(f"❌ 错误：训练文件不存在于 {config['train_file']}")
         return None, None
     
-    # 检测设备
-    if device is None:
-        device, device_name = detect_device()
-    else:
-        if device.type == "mps":
-            device_name = "MPS (Apple Silicon GPU)"
-        elif device.type == "cuda":
-            device_name = f"CUDA ({torch.cuda.get_device_name(0)})"
-        else:
-            device_name = "CPU"
+    # 检测GPU设备
+    if not torch.cuda.is_available():
+        print("❌ 错误：未检测到CUDA GPU，本脚本仅支持GPU训练")
+        return None, None
     
-    # 严格使用配置中的 batch_size 和 gradient_accumulation_steps，不做动态调整
+    device = torch.device("cuda")
+    device_name = f"CUDA ({torch.cuda.get_device_name(0)})"
+    
+    # 严格使用配置中的 batch_size 和 gradient_accumulation_steps
     batch_size = config['batch_size']
-    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 4)  # 默认值4
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 4)
     effective_batch_size = batch_size * gradient_accumulation_steps
     
     print(f"\n📝 配置说明: {config['description']}")
     print(f"\n📊 训练参数:")
-    print(f"   - 配置ID: {config_id}")
-    print(f"   - 配置名称: {config['name']}")
-    print(f"   - 设备: {device_name}")
+    print(f"   - GPU: {device_name}")
     print(f"   - 学习率: {config['learning_rate']}")
+    print(f"   - Warmup步数: 100步（固定，对齐swift配置）")
+    print(f"   - 学习率衰减: Cosine（余弦衰减）")
+    print(f"   - 正则化强度: Weight Decay = 0.1")
     print(f"   - LoRA Rank: {config['lora_rank']}")
     print(f"   - 训练轮数: {config['num_train_epochs']}")
     print(f"   - 批次大小: {batch_size}")
     print(f"   - 梯度累积步数: {gradient_accumulation_steps}")
-    print(f"   - 有效批次大小: {effective_batch_size} (batch × accumulation)")
-    print(f"   - 最大长度: {config['max_length']}")
-    print(f"   - 保存间隔: {config['save_steps']} steps")
+    print(f"   - 有效批次大小: {effective_batch_size}")
+    print(f"   - 验证集比例: {config.get('split_ratio', 0.1)*100:.0f}%")
     print(f"   - 训练数据: {config['train_file']}")
-    print(f"   - 内存优化: 已启用 Gradient Checkpointing + 禁用训练中评估")
-    
-    # 设备相关提示
-    if device.type == "cpu":
-        print("\n⚠️  注意：CPU 环境下训练速度较慢")
-        if batch_size > 4:
-            print(f"💡 提示：当前 batch_size={batch_size} 可能导致内存不足")
-            print(f"   建议：选择配置0或1（batch_size=8）或在出现内存错误时降低配置")
-    elif device.type == "mps":
-        print("\n✅ 使用 Apple Silicon GPU (MPS) 加速")
-        print(f"   LoRA内存占用：~{50 if config['lora_rank'] == 4 else 100}MB，完全可用")
-        if batch_size > 8:
-            print(f"💡 提示：当前 batch_size={batch_size}，预计总内存占用~5-6GB")
-    else:
-        print("\n✅ 使用 NVIDIA GPU 加速")
     
     # 配置输出目录
     config_dir = f"./output/config_{config_id}"
@@ -380,15 +362,15 @@ def run_fine_tune(config_id, model_path="./model", device=None):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # 加载模型
+        # 加载模型到GPU（使用fp16加速）
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if device.type in ["cuda", "mps"] else torch.float32,
-            device_map={"": device},  # 直接加载到指定设备
+            torch_dtype=torch.float16,
+            device_map={"": device},
             trust_remote_code=True,
         )
         
-        print(f"✅ 模型加载完成（设备: {device}）")
+        print(f"✅ 模型已加载到 {device_name}")
         
         # 🔥 启用梯度检查点（Gradient Checkpointing）以节省内存
         # 原理：不保存所有中间激活值，反向传播时重新计算
@@ -401,10 +383,10 @@ def run_fine_tune(config_id, model_path="./model", device=None):
         print("\n[2/5] 配置LoRA...")
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=config['lora_rank'],  # LoRA秩
-            lora_alpha=config['lora_rank'] * 2,  # 通常设置为rank的2倍
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            r=config['lora_rank'],  # LoRA秩：控制可训练参数量
+            lora_alpha=config['lora_rank'] * 2,  # LoRA缩放系数：通常为rank的2倍
+            lora_dropout=0.05,  # Dropout防止过拟合
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  # 应用到所有线性层
             bias="none",
         )
         
@@ -414,16 +396,14 @@ def run_fine_tune(config_id, model_path="./model", device=None):
         
         # ========== 步骤3：加载和准备数据集 ==========
         print("\n[3/5] 加载数据集...")
+        split_ratio = config.get('split_ratio', 0.1)
         train_dataset, eval_dataset = load_and_prepare_dataset(
             config['train_file'],
-            split_ratio=0  # 不分割验证集（禁用训练中评估以节省内存）
+            split_ratio=split_ratio
         )
         
         print(f"✅ 训练样本: {len(train_dataset)}")
-        if eval_dataset:
-            print(f"✅ 验证样本: {len(eval_dataset)}")
-        else:
-            print(f"ℹ️  无验证集（已禁用训练中评估以节省内存）")
+        print(f"✅ 验证样本: {len(eval_dataset)}")
         
         # 数据预处理
         print("   预处理数据...")
@@ -436,16 +416,20 @@ def run_fine_tune(config_id, model_path="./model", device=None):
             desc="Tokenizing train dataset"
         )
         
-        if eval_dataset:
-            eval_dataset = eval_dataset.map(
-                tokenize_fn,
-                batched=True,
-                remove_columns=eval_dataset.column_names,
-                desc="Tokenizing eval dataset"
-            )
+        eval_dataset = eval_dataset.map(
+            tokenize_fn,
+            batched=True,
+            remove_columns=eval_dataset.column_names,
+            desc="Tokenizing eval dataset"
+        )
         
         # ========== 步骤4：配置Trainer ==========
         print("\n[4/5] 配置训练器...")
+        
+        # 对于短训练（1轮），保留所有checkpoint以完整记录训练过程
+        # 对于长训练（多轮），只保留最近1个checkpoint节省磁盘
+        save_total_limit = None if config['num_train_epochs'] == 1 else 1
+        
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=config['num_train_epochs'],
@@ -453,23 +437,25 @@ def run_fine_tune(config_id, model_path="./model", device=None):
             per_device_eval_batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             learning_rate=config['learning_rate'],
-            warmup_ratio=0.1,
-            weight_decay=0.01,
-            logging_steps=config['save_steps'],  # 与 save_steps 保持一致，确保记录更多训练 loss
+            warmup_steps=100,  # 固定100步预热，与原始swift配置对齐
+            weight_decay=0.1,  # 增强L2正则化，防止过拟合
+            lr_scheduler_type="cosine",  # 余弦衰减，学习率更平滑
+            logging_steps=config['save_steps'],
             save_steps=config['save_steps'],
             save_strategy="steps",
-            save_total_limit=1,  # 只保留最终checkpoint，节省磁盘和内存
-            # 🔥 内存优化：禁用训练中评估（节省 2-3 GB 峰值内存）
-            eval_strategy="no",               # 训练时不评估（训练后用 eval.py 单独评估）
-            load_best_model_at_end=False,     # 不保存最佳模型副本
-            fp16=device.type == "cuda",  # CUDA使用fp16
-            # MPS暂不支持fp16训练，使用fp32
-            report_to=[],  # 不上报到wandb等
+            save_total_limit=save_total_limit,  # 短训练保留全部，长训练只保留最近1个
+            # 训练中评估配置（所有配置都有验证集）
+            eval_strategy="steps",
+            eval_steps=config['save_steps'],
+            load_best_model_at_end=True,  # 训练结束时自动加载验证Loss最低的模型
+            metric_for_best_model="loss",
+            fp16=True,  # 半精度训练：节省显存，加速计算（A10支持）
+            report_to=[],
             remove_unused_columns=False,
-            # 内存优化参数（不影响训练效果）
-            dataloader_num_workers=0,  # 不使用多进程加载数据，节省内存
-            dataloader_pin_memory=False,  # 不固定内存，减少RAM占用
-            gradient_checkpointing=True,  # 配合模型的gradient_checkpointing_enable
+            # GPU优化参数
+            dataloader_num_workers=4,  # 多进程并行加载数据
+            dataloader_pin_memory=True,  # 固定内存页，加速CPU→GPU数据传输
+            gradient_checkpointing=True,  # 梯度检查点：节省70%激活值显存，训练速度降低10-20%
         )
         
         # 数据整理器
@@ -492,31 +478,23 @@ def run_fine_tune(config_id, model_path="./model", device=None):
         print("\n[5/5] 开始训练...")
         print("="*80)
         
-        # 训练前清理缓存（MPS/CUDA）
-        if device.type == "mps":
-            torch.mps.empty_cache()
-            print("   → 已清理 MPS 缓存")
-        elif device.type == "cuda":
-            torch.cuda.empty_cache()
-            print("   → 已清理 CUDA 缓存")
+        # 清理GPU缓存
+        torch.cuda.empty_cache()
         
         train_result = trainer.train()
         
-        # 保存最终模型
-        trainer.save_model()
-        trainer.save_state()
-        
         print("\n✅ 微调完成！")
         
-        # 查找最佳checkpoint
-        checkpoint_dirs = glob.glob(os.path.join(output_dir, "checkpoint-*"))
-        if checkpoint_dirs:
-            latest_checkpoint = max(checkpoint_dirs, key=os.path.getmtime)
-            checkpoint_path = latest_checkpoint
-        else:
-            checkpoint_path = output_dir
+        # 保存最佳模型（已由load_best_model_at_end自动加载验证Loss最低的模型）
+        best_model_dir = os.path.join(config_dir, "best_model")
+        print(f"   保存最佳模型（验证Loss最低）到: {best_model_dir}")
+        trainer.save_model(best_model_dir)
+        trainer.save_state()
+        checkpoint_path = best_model_dir
         
-        print(f"   Checkpoint: {checkpoint_path}")
+        # 提示：训练过程中的checkpoints仍保留在checkpoints目录
+        print(f"   训练过程checkpoints: {output_dir}")
+        print(f"   评估用最佳模型: {checkpoint_path}")
         
         # 绘制 loss 曲线
         loss_curve_path = f"./output/config_{config_id}_training_loss.png"
@@ -538,34 +516,33 @@ def main():
     主函数：解析命令行参数并执行微调。
     """
     parser = argparse.ArgumentParser(
-        description="本地模型监督微调（SFT）- 基于 ms-swift + LoRA",
+        description="本地模型监督微调（SFT - GPU）- 基于 PEFT + LoRA",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-预设配置说明：
+预设配置说明（已优化，对齐原始swift配置）：
   ID 0: 过大学习率测试 - 观察训练不稳定/发散现象
-  ID 1: 快速验证（推荐）- 首次运行，5-10分钟完成
-  ID 2: 小数据集长训练 - 观察过拟合现象
-  ID 3: 大数据集标准训练 - 性能/时间平衡，推荐
-  ID 4: 大数据集长训练 - 追求最佳性能，耗时较长
+  ID 1: 快速验证（推荐）- 首次运行，1分钟完成
+  ID 2: 小数据集长训练 - 观察过拟合现象（50轮）
+  ID 3: 大数据集标准训练 - 3轮训练，预期欠拟合（教学用）
+  ID 4: 大数据集长训练 - 15轮训练，充分训练达到最佳效果
+
+关键优化（对齐swift）：
+  - Warmup: 固定100步（而非比例），Config 3预热占比大
+  - 学习率衰减: Cosine余弦衰减（更平滑）
+  - 正则化: Weight Decay = 0.1（增强版）
 
 使用示例：
-  # 配置1：快速验证（推荐首次运行）
-  python 5_model_1_sft.py --config-id 1
-
-  # 配置3：大数据集标准训练
-  python 5_model_1_sft.py --config-id 3
+  python 5_model_1_sft.py --config-id 1  # 快速验证
+  python 5_model_1_sft.py --config-id 3  # 标准训练（欠拟合示例）
+  python 5_model_1_sft.py --config-id 4  # 充分训练（最佳效果）
         """
     )
     
-    # 必需参数
+    # 参数
     parser.add_argument("--config-id", type=int, required=True,
                        help="配置ID（0-4），每个ID对应一组预设的训练参数")
-    
-    # 可选参数
     parser.add_argument("--model-path", type=str, default="./model",
                        help="基座模型路径（默认: ./model）")
-    parser.add_argument("--force-cpu", action="store_true",
-                       help="强制使用CPU训练（当MPS内存不足时使用）")
     
     args = parser.parse_args()
     
@@ -585,20 +562,10 @@ def main():
         print(f"  modelscope download --model qwen/Qwen2.5-1.5B-Instruct --local_dir '{args.model_path}'")
         return
     
-    # 检测或强制指定设备
-    if args.force_cpu:
-        device = torch.device("cpu")
-        print("\n⚠️  强制使用 CPU 训练模式")
-        print("   （适用于 MPS 内存不足的场景）")
-        disable_mps_if_needed()  # 完全禁用MPS
-    else:
-        device = None  # 自动检测
-    
     # 运行微调
     checkpoint_path, loss_curve_path = run_fine_tune(
         config_id=args.config_id,
-        model_path=args.model_path,
-        device=device
+        model_path=args.model_path
     )
     
     # 输出总结
